@@ -268,8 +268,11 @@ def _triton_shared_prefix_branch_attention(
     context_lengths: torch.Tensor,
     branch_lengths: torch.Tensor,
     branch_to_example: torch.LongTensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the forward-only Triton shared-prefix attention kernel.
+
+    ``out`` may be a contiguous ``[M, L, Hq, Dh]`` buffer to write into.
 
     Returns the same logical shape as ``qwen_branching._branched_attention``:
     ``[num_branches, branch_len, hidden_size]``.
@@ -287,7 +290,8 @@ def _triton_shared_prefix_branch_attention(
 
     # [M, L, Hq, Dh] is chosen so the result can be viewed as [M, L, hidden]
     # without a transpose/copy before Qwen's o_proj.
-    out = torch.empty((M, L, Hq, Dh), device=branch_query.device, dtype=branch_query.dtype)
+    if out is None:
+        out = torch.empty((M, L, Hq, Dh), device=branch_query.device, dtype=branch_query.dtype)
 
     block_m = 16 if L <= 64 else 32
     block_n = 64
@@ -435,6 +439,10 @@ class InferenceOptimizedQwen3BranchedModel(Qwen3BranchedModel):
 
         context_hidden = self.embed_tokens(context_input_ids)
         branch_hidden = self.embed_tokens(branch_input_ids)
+        B, P, D = context_hidden.shape
+        M, L, _ = branch_hidden.shape
+        n_ctx = B * P
+        total = n_ctx + M * L
 
         context_position_ids = self._position_ids_from_right_padded_mask(context_attention_mask)
         context_lengths = context_attention_mask.long().sum(-1).to(torch.int32)
@@ -463,28 +471,50 @@ class InferenceOptimizedQwen3BranchedModel(Qwen3BranchedModel):
         context_position_embeddings = self.rotary_emb(context_hidden, context_position_ids)
         branch_position_embeddings = self.rotary_emb(branch_hidden, branch_position_ids)
 
+        # Small batches are launch-bound, so context and candidates share one packed [1, T, D] stream
+        # for every per-token op (norms, projections, MLP); only attention treats them differently.
+        cos = torch.cat([context_position_embeddings[0].reshape(1, n_ctx, -1),
+                         branch_position_embeddings[0].reshape(1, M * L, -1)], dim=1)
+        sin = torch.cat([context_position_embeddings[1].reshape(1, n_ctx, -1),
+                         branch_position_embeddings[1].reshape(1, M * L, -1)], dim=1)
+        hidden = torch.cat([context_hidden.reshape(1, n_ctx, D), branch_hidden.reshape(1, M * L, D)], dim=1)
+        token_mask = torch.cat(
+            [context_attention_mask.reshape(-1), branch_attention_mask.reshape(-1)]
+        ).view(1, total, 1).to(hidden.dtype)
+
+        def split_heads(t):
+            heads, head_dim = t.shape[1], t.shape[-1]
+            ctx = t[0, :, :n_ctx].reshape(heads, B, P, head_dim).transpose(0, 1)
+            br = t[0, :, n_ctx:].reshape(heads, M, L, head_dim).transpose(0, 1)
+            return ctx, br
+
         for layer in self.layers[: self.config.num_hidden_layers]:
-            context_residual = context_hidden
-            branch_residual = branch_hidden
+            attn = layer.self_attn
+            residual = hidden
+            normed = layer.input_layernorm(hidden)
 
-            context_normed = layer.input_layernorm(context_hidden)
-            branch_normed = layer.input_layernorm(branch_hidden)
+            hidden_shape = (1, total, -1, attn.head_dim)
+            q = attn.q_norm(attn.q_proj(normed).view(hidden_shape)).transpose(1, 2)
+            k = attn.k_norm(attn.k_proj(normed).view(hidden_shape)).transpose(1, 2)
+            v = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+            q, k = qb.apply_rotary_pos_emb(q, k, cos, sin)
 
-            cq, ck, cv = qb._project_qkv(layer.self_attn, context_normed, context_position_embeddings)
-            bq, bk, bv = qb._project_qkv(layer.self_attn, branch_normed, branch_position_embeddings)
+            cq, bq = split_heads(q)
+            ck, bk = split_heads(k)
+            cv, bv = split_heads(v)
 
-            # Context computation remains the proven eager path.  The high-N branch computation
-            # is where the custom kernel removes score materialization, repeat_kv, and Python B loops.
-            context_attn = qb._context_causal_attention(
-                layer.self_attn,
-                cq,
-                ck,
-                cv,
-                context_attention_mask,
+            num_heads, head_dim = q.shape[1], q.shape[-1]
+            attn_buf = torch.empty((total, num_heads * head_dim), device=hidden.device, dtype=hidden.dtype)
+
+            # Right-padded real queries never see padded keys under a plain causal mask; padded
+            # rows are zeroed by token_mask below.
+            context_attn = F.scaled_dot_product_attention(
+                cq, ck, cv, is_causal=True, scale=attn.scaling, enable_gqa=True
             )
+            attn_buf[:n_ctx].view(B, P, num_heads, head_dim).copy_(context_attn.transpose(1, 2))
 
-            branch_attn = _triton_shared_prefix_branch_attention(
-                layer.self_attn,
+            _triton_shared_prefix_branch_attention(
+                attn,
                 bq,
                 bk,
                 bv,
@@ -493,23 +523,16 @@ class InferenceOptimizedQwen3BranchedModel(Qwen3BranchedModel):
                 context_lengths,
                 branch_lengths,
                 branch_to_example,
+                out=attn_buf[n_ctx:].view(M, L, num_heads, head_dim),
             )
 
-            context_hidden = context_residual + layer.self_attn.o_proj(context_attn)
-            branch_hidden = branch_residual + layer.self_attn.o_proj(branch_attn)
+            hidden = residual + attn.o_proj(attn_buf).unsqueeze(0)
+            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+            hidden = hidden * token_mask
 
-            context_residual = context_hidden
-            branch_residual = branch_hidden
-            context_hidden = context_residual + layer.mlp(layer.post_attention_layernorm(context_hidden))
-            branch_hidden = branch_residual + layer.mlp(layer.post_attention_layernorm(branch_hidden))
-
-            context_hidden = context_hidden * context_attention_mask.unsqueeze(-1).to(context_hidden.dtype)
-            branch_hidden = branch_hidden * branch_attention_mask.unsqueeze(-1).to(branch_hidden.dtype)
-
-        context_hidden = self.norm(context_hidden)
-        branch_hidden = self.norm(branch_hidden)
-        context_hidden = context_hidden * context_attention_mask.unsqueeze(-1).to(context_hidden.dtype)
-        branch_hidden = branch_hidden * branch_attention_mask.unsqueeze(-1).to(branch_hidden.dtype)
+        hidden = self.norm(hidden) * token_mask
+        context_hidden = hidden[0, :n_ctx].view(B, P, D)
+        branch_hidden = hidden[0, n_ctx:].view(M, L, D)
 
         return BranchedQwen3Output(
             context_last_hidden_state=context_hidden,
