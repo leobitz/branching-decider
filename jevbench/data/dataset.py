@@ -236,6 +236,7 @@ def normalize_jev_record(row, split_name, row_index, use_human_soft_labels=False
         "label_style": str(row.get("label_style", "unknown")),
         "candidate_count": len(labels),
         "split": split_name,
+        "original": bool(row.get("original", True)),
         "context_id": row.get("context_id"),
         "decision_id": row.get("decision_id"),
         "is_soft_target": bool(np.count_nonzero(probs > 1e-8) > 1),
@@ -287,8 +288,9 @@ def load_jev_bench_splits(args):
         by_primitive = Counter(x["primitive"] for x in ds.rows)
         by_config = Counter(x["source_config"] for x in ds.rows)
         soft = sum(x["is_soft_target"] for x in ds.rows)
+        n_orig = sum(x["original"] for x in ds.rows)
         print(
-            f"{split_name:10s}: n={len(ds):7d} | configs={len(by_config):2d} | "
-            f"primitive={dict(by_primitive)} | soft_targets={soft:,}"
+            f"{split_name:10s}: n={len(ds):7d} | original={n_orig:7d} | generated={len(ds) - n_orig:7d} | "
+            f"configs={len(by_config):2d} | primitive={dict(by_primitive)} | soft_targets={soft:,}"
         )
     return processed_dir, datasets

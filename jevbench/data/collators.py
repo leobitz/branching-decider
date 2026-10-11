@@ -11,6 +11,25 @@ import torch
 from .constants import TASK_TYPES
 from .bev_formatting import bev_encode_example
 
+
+def hierarchical_prefix(context, query):
+    context, query = str(context or ""), str(query or "")
+    if context.strip():
+        return f"Context: {context}\nQuery: {query}\nCandidate:"
+    return f"Query: {query}\nCandidate:"
+
+
+def hierarchical_token_length(tokenizer, context, query, labels, max_label_length):
+    """Untruncated tokens the hierarchical collator needs: shared prefix + longest candidate branch."""
+    n_prefix = len(tokenizer(hierarchical_prefix(context, query), add_special_tokens=True)["input_ids"])
+    n_branch = max(
+        len(tokenizer(" " + str(label), add_special_tokens=False, truncation=True,
+                      max_length=max_label_length - 1)["input_ids"]) + 1
+        for label in labels
+    )
+    return n_prefix + n_branch
+
+
 @dataclass
 class BranchingVariableChoiceCollator:
     """Build one shared prefix per example and one flattened row per candidate branch.
@@ -82,13 +101,7 @@ class BranchingVariableChoiceCollator:
             choice_texts.append(labels)
             target_probs[b, : len(labels)] = torch.tensor(probs, dtype=torch.float32)
 
-            context = str(ex.get("context", ""))
-            query = str(ex.get("query", ""))
-            if context.strip():
-                prefix = f"Context: {context}\nQuery: {query}\nCandidate:"
-            else:
-                prefix = f"Query: {query}\nCandidate:"
-            prefixes.append(prefix)
+            prefixes.append(hierarchical_prefix(ex.get("context", ""), ex.get("query", "")))
 
             for j, label in enumerate(labels):
                 # Candidate is a suffix of the shared prefix. A common terminal

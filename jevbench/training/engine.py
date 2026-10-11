@@ -141,6 +141,12 @@ def train(args):
         model.train()
         return metrics
 
+    n_original = sum(1 for r in train_data.rows if r["original"])
+    print(
+        f"Training data: original={n_original:,} reformulated={len(train_data) - n_original:,} "
+        f"total={len(train_data):,}"
+    )
+
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
     running_loss, running_acc = [], []
