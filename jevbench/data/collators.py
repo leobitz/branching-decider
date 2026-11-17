@@ -269,7 +269,7 @@ class BEVJevCollator:
 
 def build_collators(args, tokenizer):
     """Return (train_collator, eval_collator) for the selected architecture."""
-    if args.architecture == "hierarchical":
+    if args.architecture in ("hierarchical", "adaptive"):
         common = dict(
             tokenizer=tokenizer,
             max_length=args.max_length,

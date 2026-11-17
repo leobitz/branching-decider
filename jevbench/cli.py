@@ -20,6 +20,8 @@ def _add_common(p):
     p.add_argument("--surface-seed", type=int, default=42)
     p.add_argument("--configs", default=None, help="Comma-separated JEV-Bench configs; default loads all.")
     p.add_argument("--use-human-soft-labels", action="store_true", default=False)
+    p.add_argument("--no-reformulate-data", dest="use_reformulated_data", action="store_false", default=True,
+                   help="Train only on original rows; drop reformulated/generated rows from the train split.")
 
     p.add_argument("--quick-run", action="store_true", default=True)
     p.add_argument("--full-run", dest="quick_run", action="store_false")
@@ -68,6 +70,30 @@ def _add_hierarchical(p):
     p.add_argument("--dropout", type=float, default=0.0)
 
 
+def _add_adaptive(p):
+    p.add_argument("--max-length", type=int, default=512)
+    p.add_argument("--max-label-length", type=int, default=96)
+    p.add_argument("--label-layers", type=int, default=2, help="Blocks in the weight-tied loop body")
+    p.add_argument("--label-heads", type=int, default=8)
+    p.add_argument("--label-ff-mult", type=int, default=4)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--max-loops", type=int, default=4, help="Maximum label-reasoner loops T")
+    p.add_argument("--exit-loss-mode", choices=("joint", "aux", "gate"), default="joint",
+                   help="joint: expected loss + compute/entropy/aux terms; aux: per-loop supervision only; "
+                        "gate: train only the exit head from detached loop-improvement targets")
+    p.add_argument("--compute-weight", type=float, default=0.0002, help="lambda: cost per expected loop")
+    p.add_argument("--entropy-weight", type=float, default=0.05, help="beta: exit-distribution entropy bonus")
+    p.add_argument("--aux-weight", type=float, default=0.5, help="eta: mean per-loop loss weight")
+    p.add_argument("--gate-sharpness", type=float, default=10.0, help="k in sigmoid(k*(improvement - lambda))")
+    p.add_argument("--exit-threshold", type=float, default=0.7, help="Inference: exit when P(exit | loop) >= this")
+    p.add_argument("--context-cross-attn", action=argparse.BooleanOptionalAction, default=False,
+                   help="Let every loop cross-attend to the question/context states (output shape unchanged). "
+                        "Default: plain thinking over branch tokens only")
+    p.add_argument("--decision-feedback", action=argparse.BooleanOptionalAction, default=True,
+                   help="Let loops compare candidates, revise cumulative scores, and feed the decision "
+                        "back into the next loop")
+
+
 def _add_bev(p):
     p.add_argument("--max-state-tokens", type=int, default=512)
     p.add_argument("--max-choice-tokens", type=int, default=96)
@@ -86,6 +112,10 @@ def parse_args(argv=None):
     _add_common(h)
     _add_hierarchical(h)
 
+    a = sub.add_parser("adaptive", help="Shared-trunk branched Qwen + adaptive-depth looped label reasoner")
+    _add_common(a)
+    _add_adaptive(a)
+
     b = sub.add_parser("bev", help="BEV packed masking/position trick + BEV ChoiceHead")
     _add_common(b)
     _add_bev(b)
@@ -95,7 +125,7 @@ def parse_args(argv=None):
         args.epochs = 1 if args.quick_run else 5
     if args.quick_run:
         if args.train_samples_per_epoch is None:
-            args.train_samples_per_epoch = 16_000 if args.architecture == "hierarchical" else 16_000
+            args.train_samples_per_epoch = 16_000 if args.architecture in ("hierarchical", "adaptive") else 16_000
         args.max_val_examples = args.max_val_examples or 5_000
         args.max_test_examples = args.max_test_examples or 5_000
     if args.output_dir is None:

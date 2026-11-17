@@ -226,7 +226,26 @@ class JevDecider:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         model = build_model(args, dtype)
-        model.load_state_dict(torch.load(path / "model.pt", map_location="cpu"))
+        state = torch.load(path / "model.pt", map_location="cpu")
+        if config.get("architecture") == "adaptive" and "decision_feedback" not in config:
+            incompatible = model.load_state_dict(state, strict=False)
+            allowed_missing = (
+                "decision_feedback.",
+                "candidate_reasoner.",
+                "candidate_gate",
+                "exit_decision_projection.",
+            )
+            unexpected = incompatible.unexpected_keys
+            missing = [
+                key for key in incompatible.missing_keys
+                if not any(key.startswith(prefix) for prefix in allowed_missing)
+            ]
+            if unexpected or missing:
+                raise RuntimeError(
+                    f"Incompatible adaptive checkpoint: missing keys {missing}, unexpected keys {unexpected}"
+                )
+        else:
+            model.load_state_dict(state)
         return cls(model.to(device), tokenizer, args, device, batch_size)
 
     @torch.no_grad()

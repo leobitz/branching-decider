@@ -41,6 +41,8 @@ def evaluate(model, loader, device, use_amp, amp_dtype, architecture, max_batche
     model.eval()
     losses, correct, total = [], 0, 0
     nll_sum = brier_sum = 0.0
+    loops_sum = 0.0
+    has_loops = False
     for bi, batch in enumerate(loader):
         if max_batches is not None and bi >= max_batches:
             break
@@ -53,6 +55,12 @@ def evaluate(model, loader, device, use_amp, amp_dtype, architecture, max_batche
         target_probs = b["target_probs"].float()
         pred = out["logits"].argmax(-1)
         gold = target_probs.argmax(-1)
+        if "exit_depth" in out:
+            has_loops = True
+            loops_sum += float(out["exit_depth"].float().sum().item())
+        elif "expected_loops" in out:
+            has_loops = True
+            loops_sum += float(out["expected_loops"]) * len(pred)
         correct += int((pred == gold).sum().item())
         total += len(pred)
         safe = probs.clamp_min(1e-12)
@@ -61,9 +69,12 @@ def evaluate(model, loader, device, use_amp, amp_dtype, architecture, max_batche
         brier_sum += float((diff * diff).sum(-1).sum().item())
     n = max(total, 1)
     model.train()
-    return {
+    metrics = {
         "loss": float(np.mean(losses)) if losses else float("nan"),
         "acc": correct / n,
         "nll": nll_sum / n,
         "brier": brier_sum / n,
     }
+    if has_loops:
+        metrics["loops"] = loops_sum / n
+    return metrics

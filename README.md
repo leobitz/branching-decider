@@ -4,6 +4,7 @@ Train and run typed decision models (Choice, Score, Noul) on the JEV-Bench data 
 Two architectures share the same data, training loop and inference API:
 
 - `hierarchical`: shared-trunk branched Qwen + label/candidate Transformer
+- `adaptive`: shared-trunk branched Qwen + decision-aware recurrent label reasoner
 - `bev`: BEV packed masking/position trick + BEV choice head
 
 Use the `py11` conda environment (`conda activate py11`).
@@ -12,9 +13,14 @@ Use the `py11` conda environment (`conda activate py11`).
 
 ```bash
 python train.py hierarchical --full-run --epochs 1 --batch-size 16 --grad-accum-steps 8 --label-layers 2 --candidate-layers 0
+python train.py adaptive --full-run --epochs 1 --batch-size 8 --grad-accum-steps 2 --label-layers 2 --max-loops 4
 python train.py bev --full-run --epochs 3 --batch-size 1 --grad-accum-steps 16
 python train.py bev --epochs 1 --batch-size 8 --grad-accum-steps 1 --no-wandb   # quick run
 ```
+
+Adaptive decision feedback is enabled by default: each loop compares candidate states, revises cumulative
+scores, and feeds its confidence/margin back into the next loop. Use `--no-decision-feedback` for the
+branch-only loop baseline; `--context-cross-attn` additionally lets each loop read the question/context.
 
 The best-validation checkpoint is written to `checkpoints_jev_<architecture>/best_val`
 (`model.pt`, tokenizer files, `config.json`). Override the location with `--output-dir`.

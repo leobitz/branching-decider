@@ -133,9 +133,10 @@ def train(args):
         log({f"val/{k}": v for k, v in metrics.items()}, step)
         saved = checkpoint.maybe_save(metrics["acc"], metrics["loss"], step, model, tokenizer, model_config)
         tag = " -> saved best_val" if saved is not None else ""
+        loops = f" loops={metrics['loops']:.2f}" if "loops" in metrics else ""
         print(
             f"[step {step}] val loss={metrics['loss']:.4f} acc={metrics['acc']:.4f} "
-            f"nll={metrics['nll']:.4f} brier={metrics['brier']:.4f}{tag}"
+            f"nll={metrics['nll']:.4f} brier={metrics['brier']:.4f}{loops}{tag}"
         )
         last_eval_step = step
         model.train()
@@ -149,7 +150,7 @@ def train(args):
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
-    running_loss, running_acc = [], []
+    running_loss, running_acc, running_loops = [], [], []
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -158,13 +159,17 @@ def train(args):
             b = move_tensor_batch(batch, device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 out = forward_batch(model, b, args.architecture)
-                loss = distribution_cross_entropy(out["logits"], b["target_probs"], b["candidate_mask"])
+                loss = out.get("loss")
+                if loss is None:
+                    loss = distribution_cross_entropy(out["logits"], b["target_probs"], b["candidate_mask"])
                 scaled_loss = loss / args.grad_accum_steps
 
             raise_nonfinite_forward(out, loss, micro_step)
             scaler.scale(scaled_loss).backward()
             running_loss.append(float(loss.item()))
             running_acc.append(argmax_accuracy(out["logits"].detach(), b["target_probs"]))
+            if "expected_loops" in out:
+                running_loops.append(float(out["expected_loops"]))
 
             if micro_step % args.grad_accum_steps == 0 or micro_step == len(train_loader):
                 scaler.unscale_(optimizer)
@@ -179,7 +184,10 @@ def train(args):
                     tr_loss = float(np.mean(running_loss[-args.grad_accum_steps:]))
                     tr_acc = float(np.mean(running_acc[-args.grad_accum_steps:]))
                     lr = float(scheduler.get_last_lr()[0])
-                    log({"train/loss": tr_loss, "train/acc": tr_acc, "train/lr": lr, "epoch": epoch}, global_step)
+                    payload = {"train/loss": tr_loss, "train/acc": tr_acc, "train/lr": lr, "epoch": epoch}
+                    if running_loops:
+                        payload["train/expected_loops"] = float(np.mean(running_loops[-args.grad_accum_steps:]))
+                    log(payload, global_step)
                     pbar.set_postfix(loss=f"{tr_loss:.3f}", acc=f"{tr_acc:.3f}")
 
                 if args.eval_every and global_step % args.eval_every == 0:

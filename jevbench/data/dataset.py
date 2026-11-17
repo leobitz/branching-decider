@@ -268,6 +268,8 @@ class JevBenchDecisionDataset(Dataset):
 def load_jev_bench_splits(args):
     processed_dir = prepare_jev_bench_cache(args)
     raw = {s: _read_jsonl(processed_dir / f"{s}.jsonl") for s in PROCESSED_SPLITS}
+    if not getattr(args, "use_reformulated_data", True):
+        raw["train"] = [r for r in raw["train"] if r.get("original", True)]
     limits = {
         "train": args.max_train_examples,
         "validation": args.max_val_examples,
